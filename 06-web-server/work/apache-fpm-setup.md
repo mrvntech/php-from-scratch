@@ -157,4 +157,4 @@ Log cần xem: `/var/log/apache2/php.local-error.log`, `/var/log/php8.5-fpm.log`
 - Đổi `pm = static | dynamic | ondemand`, reload, quan sát số process bằng `ps`.
 - Điền cột B trong `compare.md`.
 
-Xem thêm: [request-flow.md](request-flow.md) (mục 5: luồng request qua Apache + FPM), [fpm-vs-servlet-container.md](fpm-vs-servlet-container.md).
+Xem thêm: [socket.md](socket.md) (Unix socket và quyền file socket), [request-flow.md](request-flow.md) (mục 5: luồng request qua Apache + FPM), [fpm-vs-servlet-container.md](fpm-vs-servlet-container.md).
