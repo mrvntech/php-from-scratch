@@ -264,6 +264,172 @@ client: read() trả về "hello"
 | **Trông như blocking, bên dưới là epoll** | Goroutine / virtual thread "đỗ" lại, runtime dùng epoll | Go (`net/http`, docker CLI, dockerd), Java 21 virtual thread |
 | Busy-wait | `while(true)` thử đọc liên tục | Không ai dùng: tốn 100% CPU |
 
+## 12. File `.sock` nằm ở đâu và dùng để làm gì
+
+### `/run/docker.sock` cũng không nằm trên disk
+```
+$ findmnt /run
+/run  tmpfs          ← filesystem nằm hoàn toàn trong RAM, mất khi tắt máy
+```
+Vì vậy systemd và FPM phải tạo lại socket mỗi lần khởi động. (`/tmp` trên máy này cũng là tmpfs.)
+
+File socket **có thể** nằm trên disk thật nếu `bind()` vào đường dẫn trên ext4 (`/home/dev/x.sock`). Khi đó disk chỉ có **inode** (loại `s`, owner, quyền), không có nội dung. Dữ liệu không bao giờ chạm disk, dù file nằm ở đâu.
+```
+/run/docker.sock (tmpfs):
+  RAM: [inode 177 trong tmpfs]  ──bind──  [socket object 6303] ── buffer
+  Disk: (không có gì)
+
+/home/dev/x.sock (ext4):
+  Disk: [inode, size 0]  ──bind──  RAM: [socket object] ── buffer
+```
+
+### Hai vai trò của file
+| Vai trò | Ý nghĩa |
+|---|---|
+| **Địa chỉ (tên)** | Client `connect("/run/docker.sock")`, kernel tra đường dẫn để **tìm** socket object đang listen |
+| **Phân quyền** | Kernel kiểm tra quyền `w` trên file (và `x` trên thư mục cha) **lúc `connect()`** |
+
+Quyền được kiểm tra **một lần ở `connect`**, không phải ở mỗi lần ghi.
+
+### Abstract socket: không có file vẫn chạy
+Tên bắt đầu bằng byte `\0`, **không tạo file nào**:
+```python
+s.bind('\0hoc-php-demo'); s.listen()
+c.connect('\0hoc-php-demo')
+```
+```
+abstract socket: connect OK, không có file nào trên filesystem
+u_str LISTEN 0 128  @hoc-php-demo  694817      ← ss hiển thị bằng ký tự @
+```
+Chứng minh file chỉ để **đặt tên và khoá cửa**. Đổi lại, abstract socket **không có quyền file**: mọi process trong cùng *network namespace* đều connect được. Vì vậy Docker, FPM dùng socket có file.
+
+### `SO_PEERCRED`: server hỏi kernel "ai đang kết nối?"
+```
+server hỏi kernel "ai đang kết nối?" (SO_PEERCRED): pid=45801 uid=1000 gid=1000
+```
+Kernel trả **pid, uid, gid thật** của đầu bên kia, client không giả mạo được. Dùng bởi PostgreSQL `peer` authentication (user Linux `dev` → role `dev` không cần mật khẩu), systemd, D-Bus, Docker authz plugin.
+```
+lớp 1 (kernel, trước khi kết nối):     quyền file socket → ai được connect
+lớp 2 (chương trình, sau khi kết nối): SO_PEERCRED      → biết chính xác ai, tự quyết định
+```
+
+## 13. Dữ liệu và danh tính được lưu ở đâu
+
+Cả hai đều nằm trong **socket object** trong RAM của kernel, không nằm trong file:
+```
+socket object (struct sock)
+├─ trạng thái: LISTEN / ESTABLISHED / ...
+├─ con trỏ tới socket ở đầu bên kia (Unix socket)
+├─ sk_peer_pid, sk_peer_cred     ← DANH TÍNH đầu bên kia: pid, uid, gid
+├─ sk_receive_queue              ← DỮ LIỆU chờ read(): danh sách khối sk_buff
+├─ giới hạn buffer: SO_RCVBUF, SO_SNDBUF
+└─ wait queue                    ← process đang ngủ chờ dữ liệu
+```
+
+### Danh tính được chụp lúc `connect()`
+```
+client (uid=1000) connect("/run/docker.sock")
+  └─ kernel: kiểm tra quyền file (lớp 1)
+             tạo cặp socket kết nối
+             CHÉP pid/uid/gid của client vào socket phía server → sk_peer_cred
+             CHÉP danh tính server vào socket phía client
+server getsockopt(SO_PEERCRED) → kernel đọc lại sk_peer_cred
+```
+- Kernel tự ghi từ chính process gọi `connect()`, nên không giả mạo được.
+- Chụp **tại thời điểm kết nối**: client đổi user sau đó (`setuid`) thì giá trị vẫn như cũ.
+
+### Dữ liệu nằm trong hàng đợi `sk_buff`
+Mỗi `write()`, kernel cấp một khối **`sk_buff`**, chép byte vào, móc vào **hàng đợi nhận** của socket đầu kia. `read()` chép ra bộ nhớ process rồi giải phóng.
+```
+write(a, 3000 byte)                                        read(b)
+   ▼                                                          ▲
+ [sk_buff 3000 byte] ──móc vào──► hàng đợi nhận của b: [skb][skb]... ──chép ra──┘
+                                   (RAM của kernel)
+```
+Demo: `a` gửi 3000 byte, `b` chưa đọc:
+```
+u_str ESTAB 3000  0  ... users:(("python3",pid=46511,fd=4))
+             └─ Recv-Q = 3000: đang nằm trong kernel chờ b đọc
+
+buffer gửi tối đa (SO_SNDBUF): 212992 byte                       (~208 KB mặc định)
+gửi thêm 176128 byte thì buffer ĐẦY → write sẽ bị chặn (backpressure)
+```
+Đầy thì `write()` blocking **ngủ**, non-blocking trả `EAGAIN`. Chỉnh bằng `SO_SNDBUF`/`SO_RCVBUF`, hoặc `net.core.wmem_default`, `rmem_default`.
+
+### Thứ gì nằm ở đâu
+| Thứ | Nằm ở | Sống bao lâu |
+|---|---|---|
+| Tên `/run/docker.sock`, owner, quyền | **Inode** (tmpfs = RAM) | Tới `unlink()` hoặc tắt máy |
+| Trạng thái kết nối, con trỏ đầu kia | **Socket object** (RAM kernel) | Tới khi cả hai `close()` |
+| Danh tính peer (`SO_PEERCRED`) | **Socket object** (`sk_peer_cred`) | Cùng kết nối |
+| Dữ liệu chưa đọc | **Hàng đợi `sk_buff`** (RAM kernel) | Tới khi bên kia `read()` |
+| Dữ liệu đã đọc | **Bộ nhớ process** (`$body`, `[]byte`...) | Do chương trình quản lý |
+
+TCP giống vậy, thêm IP/port hai đầu, số thứ tự, **hàng đợi gửi lại** (byte chưa ACK). TCP **không có** `SO_PEERCRED`, vì kernel không biết uid của process ở máy khác.
+
+## 14. File `.sock` và fd: ổ khoá và chìa khoá
+
+| | **File `.sock`** (đường dẫn) | **fd** |
+|---|---|---|
+| Là gì | Inode: tên, owner, quyền | Con số trong bảng fd **của từng process**, trỏ tới socket object |
+| Dùng khi nào | **Chỉ lúc `connect()`** | **Mọi thao tác sau đó**: `read`, `write`, `close`, `epoll` |
+| Vai trò | **Tìm** socket listen + **kiểm tra quyền connect** | **Cầm** socket object để trao đổi dữ liệu |
+| Ai có | Ai đi qua được thư mục đều thấy | Chỉ process đã `socket()`/`connect()`/`accept()`, hoặc được thừa hưởng / truyền fd |
+
+```
+1. client: socket()                  → kernel tạo socket object, trả fd 3      (fd có trước cả khi kết nối)
+2. client: connect(3, "/run/docker.sock")
+             └─ kernel dùng FILE: tìm socket listen + kiểm tra quyền w        ← vai trò của FILE
+3. client: write(3, ...), read(3)    → kernel dùng fd 3 tìm socket object      ← vai trò của fd
+                                        KHÔNG kiểm tra quyền file nữa
+```
+
+**Có fd là có quyền.** Kernel không kiểm tra quyền ở mỗi `read`/`write`. fd là **chìa khoá đã mở cửa**, file là **ổ khoá**:
+- Worker FPM **thừa hưởng fd** từ master qua `fork()`, không kiểm tra lại quyền file.
+- systemd **truyền fd** cho dockerd (`-H fd://`).
+- Process có thể **gửi fd** cho process khác qua Unix socket (`SCM_RIGHTS`). Bên nhận dùng được ngay, **kể cả khi không có quyền trên file `.sock`**.
+- `chmod 000 /run/docker.sock` **sau khi** client đã kết nối: client vẫn đọc ghi bình thường.
+
+## 15. Cùng kernel và khác kernel
+
+**Mỗi kernel luôn chỉ quản lý process và socket trên máy của chính nó.** Hai kernel không điều khiển được nhau, chỉ **phối hợp qua gói tin TCP**.
+
+### Cùng một kernel
+```
+            ┌──────────────────────── 1 KERNEL ────────────────────────┐
+ client ──► │ socket A ──── chép thẳng byte vào hàng đợi ────► socket B │ ◄── server
+ write/read │  (đánh thức B khi có dữ liệu, chặn A khi B đầy)           │     read/write
+            └───────────────────────────────────────────────────────────┘
+```
+Một kernel giữ cả hai socket: chép byte, đánh thức, backpressure, phân quyền bằng file + `SO_PEERCRED`. Áp dụng cho Unix socket. TCP qua `127.0.0.1` cũng một kernel, nhưng chạy đầy đủ TCP stack, đóng vai cả hai đầu.
+
+### Hai kernel
+```
+     MÁY A                                                    MÁY B
+┌──────── KERNEL A ────────┐                          ┌──────── KERNEL B ────────┐
+│ socket client            │   gói TCP qua mạng       │ socket server            │
+│  buffer gửi ────────────►│══ SYN/ACK, dữ liệu, ════►│──► buffer nhận           │
+│  buffer nhận ◄───────────│◄═ ACK, window, FIN ══════│◄── buffer gửi            │
+│ cho client ngủ/đánh thức │                          │ cho server ngủ/đánh thức │
+└──────────────────────────┘                          └──────────────────────────┘
+```
+
+| Việc | Cùng kernel | Khác kernel |
+|---|---|---|
+| Chuyển dữ liệu | Chép buffer A sang buffer B | Kernel A gửi gói, kernel B nhận vào buffer của B |
+| Ngủ / đánh thức | Một kernel lo cả hai | **Mỗi kernel tự lo process của mình**. Kernel B đánh thức server khi card mạng báo có gói |
+| Backpressure | Buffer B đầy thì `write` của A ngủ ngay | Kernel B quảng bá **TCP receive window** trong ACK. Window = 0 thì kernel A ngừng gửi, buffer gửi A đầy dần, rồi `write` của client ngủ |
+| Không mất dữ liệu | Không cần (chép trong RAM) | Kernel A giữ byte chưa ACK để **gửi lại** |
+| Phát hiện bên kia đóng | Thấy ngay | Gói **FIN** / **RST**. Máy B mất điện thì kernel A **không biết** tới khi gửi không được ACK hoặc TCP keepalive phát hiện |
+| Phân quyền | Quyền file + `SO_PEERCRED` | **Không có**. Chuyển lên **ứng dụng** (token, mật khẩu, TLS client cert) và **firewall** |
+
+Vì dòng cuối mà Docker mặc định chỉ nghe Unix socket: mở `tcp://0.0.0.0:2375` không TLS thì **ai trên mạng cũng điều khiển được dockerd**.
+
+### Trường hợp thực tế
+- **Container trên cùng host dùng chung kernel** (chỉ là process + namespace, không có kernel riêng). Vì vậy `-v /var/run/docker.sock:/var/run/docker.sock` chạy được, và cũng vì vậy nó nguy hiểm: container đó điều khiển được dockerd.
+- **WSL2 có kernel Linux riêng** trong máy ảo, tách khỏi kernel Windows. Trình duyệt Windows vào `php.local` trong WSL là kết nối **giữa hai kernel** qua mạng ảo, phải dùng TCP.
+- **Unix socket chỉ dùng được trong cùng một kernel.** Qua kernel khác thì dùng TCP/UDP.
+
 ## Liên hệ Java
 
 - TCP socket: `java.net.ServerSocket` / `Socket`, hoặc NIO `ServerSocketChannel` (Acceptor của Tomcat dùng cái này).
@@ -278,5 +444,9 @@ client: read() trả về "hello"
 - Socket object là **cái ống do kernel quản lý**, không phải chương trình. Chương trình lắng nghe, hiểu giao thức và quyết định đóng. Kernel giữ trạng thái và chuyển byte.
 - Chỉ server `listen`. Mỗi `accept()` tạo một socket kết nối riêng. Hai bên `read`/`write` trên socket của mình.
 - `read()` không có dữ liệu thì process **ngủ**. Muốn phục vụ nhiều kết nối thì dùng **epoll**.
+- `/run/docker.sock` nằm trên **tmpfs** (RAM). File có hai vai trò: **địa chỉ** và **ổ khoá** (kiểm tra lúc `connect`). Abstract socket không có file. `SO_PEERCRED` cho server biết chính xác client là ai.
+- **Danh tính peer** và **dữ liệu** (hàng đợi `sk_buff`, ~208 KB mặc định) đều nằm trong **socket object**.
+- **File là ổ khoá, fd là chìa khoá**: có fd là đọc ghi được, không kiểm tra quyền lại.
+- **Cùng kernel**: một kernel lo cả hai đầu. **Khác kernel**: mỗi kernel lo máy mình, phối hợp bằng TCP (ACK, window, gửi lại, FIN/RST), phân quyền chuyển lên ứng dụng. Container dùng chung kernel host, WSL2 có kernel riêng.
 
 Xem thêm: [apache-fpm-setup.md](apache-fpm-setup.md), [request-flow.md](request-flow.md), [../../05-http-raw/work/http-connection.md](../../05-http-raw/work/http-connection.md), [../../10-docker/work/docker-architecture.md](../../10-docker/work/docker-architecture.md).
