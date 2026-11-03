@@ -136,6 +136,134 @@ sudo lsof -U | grep php-fpm      # Unix socket mà php-fpm đang mở
 namei -l /run/php/study.sock     # quyền từng thư mục cha
 ```
 
+## 8. Ba thứ cùng được gọi là "socket": đường dẫn, socket object, fd
+
+| Thứ | Là gì | Nằm ở đâu | Ví dụ trên máy |
+|---|---|---|---|
+| **Đường dẫn** `/run/docker.sock` | **Cái tên** (special file loại `s`) để client tìm tới socket | Filesystem | inode **177** |
+| **Socket object** | **Đối tượng thật**: trạng thái LISTEN, hàng đợi accept, buffer | Bộ nhớ kernel | inode **6303** |
+| **File descriptor (fd)** | **Con số** riêng của từng process để cầm socket object | Bảng fd của mỗi process | `3`, `7`... |
+
+```bash
+stat -c '%i %n' /run/docker.sock                            # 177  /run/docker.sock  ← inode FILE
+ss -xl | awk '$5=="/run/docker.sock"{print $6, $5}'         # 6303 /run/docker.sock  ← inode SOCKET
+```
+Cùng tên nhưng hai inode khác nhau. `bind()` gắn tên với socket object.
+
+Ví von: đường dẫn là **số điện thoại**, socket object là **tổng đài**, fd là **ống nghe trong tay** mỗi người (mỗi người tự đánh số, nhiều ống nghe có thể nối vào cùng một tổng đài).
+
+**`dockerd -H fd://`** (systemd socket activation): systemd tạo socket object, `bind("/run/docker.sock")`, đặt quyền `root:docker 0660`, `listen()`, rồi **truyền fd** sang dockerd (biến `LISTEN_FDS`, xuất hiện ở fd 3). Thứ được truyền là **fd**, không phải file `.sock`. Worker FPM thừa hưởng socket từ master cũng theo cách này: thừa hưởng **fd** qua `fork()`.
+
+## 9. Socket object là cái ống do kernel quản lý, không phải chương trình
+
+Socket object là **cấu trúc dữ liệu trong kernel** (`struct socket`, `sock`, `unix_sock`): trạng thái, hàng đợi kết nối chờ `accept`, buffer gửi và nhận, con trỏ tới đầu bên kia.
+- **Không tự chạy**: không có thread, không có vòng lặp. Nó chỉ "hoạt động" khi process gọi system call vào nó, lúc đó **code của kernel** chạy thay cho process.
+- **Không hiểu HTTP**: `GET /containers/json HTTP/1.1` với nó chỉ là dãy byte.
+
+```
+┌─────────────── user space (chương trình) ────────────────┐
+│ docker CLI                               dockerd          │
+│  - tạo HTTP request                       - accept()      │
+│  - quyết định connect / close             - parse HTTP    │
+│  - parse HTTP response, in bảng           - router, xử lý │
+└──────┬─────────────────────────────────────────┬─────────┘
+       │ system call: connect/write/read/close   │ accept/read/write/close
+┌──────▼─────────────────────────────────────────▼─────────┐
+│ KERNEL                                                    │
+│  socket object: [trạng thái][hàng đợi accept][buffer A][buffer B]
+│  - kiểm tra quyền lúc connect                             │
+│  - xếp kết nối vào hàng đợi chờ accept (backlog)          │
+│  - chép byte vào buffer, giữ đúng thứ tự                  │
+│  - chặn write khi buffer đầy (backpressure)               │
+│  - báo EOF khi một bên close/shutdown                     │
+└───────────────────────────────────────────────────────────┘
+```
+
+| Việc | Ai làm |
+|---|---|
+| "Lắng nghe" | **Chương trình** gọi `listen()` + `accept()`. Kernel chỉ đánh dấu LISTEN và giữ hàng đợi |
+| Hiểu HTTP, JSON, FastCGI | **Chương trình** |
+| Chuyển byte, thứ tự, buffer, backpressure | **Kernel** |
+| Giữ trạng thái "đang kết nối" | **Kernel** |
+| Quyết định kết nối sống bao lâu | **Hai chương trình** (khi nào gọi `close()`) |
+
+### Demo: kernel giữ kết nối dù server không làm gì
+Server `listen()` nhưng **không bao giờ `accept()`**, không đọc:
+```python
+s = socket.socket(socket.AF_UNIX); s.bind('lazy.sock'); s.listen(); time.sleep(4)
+```
+```
+client: connect OK, gửi được 5016 byte dù server chưa accept
+$ ss -xa
+u_str LISTEN 1 ... lazy.sock      ← Recv-Q = 1: một kết nối đang nằm trong hàng đợi accept của kernel
+```
+Với socket activation của Docker cũng vậy: `dockerd` bị stop thì systemd vẫn giữ `/run/docker.sock`. Client connect vẫn được, kết nối nằm chờ, tới khi systemd khởi động lại dockerd.
+
+### TCP: kernel làm nhiều hơn
+Unix socket chỉ cần chép byte giữa hai buffer trong cùng máy. Với TCP, **kernel** còn lo: bắt tay 3 bước, số thứ tự, ACK, gửi lại gói mất, sắp xếp lại gói, điều khiển luồng và tắc nghẽn, keepalive, `TIME_WAIT`. Tất cả vẫn là code kernel (chạy khi có ngắt mạng hoặc timer), không phải chương trình riêng. Chương trình vẫn chỉ thấy một ống byte có thứ tự. Vì vậy dockerd nghe `unix://` hay `tcp://` đều dùng chung code.
+
+## 10. Socket listen và socket kết nối
+
+**Chỉ server `listen`.** Client `connect`. Sau khi kết nối, **cả hai** đều `read`/`write` trên socket của mình.
+
+```
+SERVER (dockerd)                                   CLIENT (docker CLI)
+
+① socket listen  ─ chỉ để NHẬN KẾT NỐI MỚI
+   bind("/run/docker.sock"), listen()
+   KHÔNG truyền dữ liệu qua socket này
+        │  accept()                                 socket()
+        │◄───────────── kết nối mới ─────────────── connect("/run/docker.sock")
+        ▼
+② socket kết nối (do accept tạo ra)  ◄═══ cặp socket nối chéo ═══►  ③ socket kết nối của client
+   read / write                                                      read / write
+```
+
+| Socket | Thuộc về | Dùng để | System call |
+|---|---|---|---|
+| ① **listen** | Server | Nhận kết nối mới. Mỗi `accept()` sinh ra một ② | `bind`, `listen`, `accept` |
+| ② **kết nối** phía server | Server, mỗi client một cái | Trao đổi dữ liệu với **một** client | `read`, `write`, `close` |
+| ③ **kết nối** phía client | Client | Trao đổi dữ liệu với server | `connect`, `read`, `write`, `close` |
+
+dockerd phục vụ 5 lệnh `docker` cùng lúc thì có **1 socket listen + 5 socket kết nối** (`ss -xa`: một dòng `LISTEN`, nhiều dòng `ESTAB`). Ví von: ① là **quầy lễ tân**, ② và ③ là **bàn** nơi hai bên nói chuyện.
+
+| | Socket listen | Socket kết nối |
+|---|---|---|
+| PHP-FPM | `listen = /run/php/study.sock`, mọi worker cùng `accept()` | Mỗi request từ Nginx một socket |
+| Tomcat | `ServerSocketChannel` của Acceptor | `SocketChannel` mà Poller theo dõi |
+| Java API | `ServerSocket.accept()` trả về `Socket` | `new Socket(host, port)` |
+
+## 11. Chờ dữ liệu: client không quay vòng hỏi liên tục
+
+Gọi `read()` khi chưa có dữ liệu thì **kernel cho process ngủ**, và **đánh thức** khi dữ liệu tới. Lúc ngủ gần như không tốn CPU.
+
+Demo: server đợi 3 giây mới gửi, trong lúc đó xem client:
+```
+  PID STAT %CPU WCHAN                CMD
+40817 S     0.6 unix_stream_read_gen python3 ... c.recv(100)
+              │         └─ đang ngủ trong hàm đọc Unix socket của kernel
+              └─ S = Sleeping
+client nhận: b'hello sau 3 giay' sau 3.0s
+```
+
+```
+client: read(fd)
+  └─► kernel: buffer rỗng → đưa process vào wait queue của socket → Sleeping, CPU cho process khác
+                    ... process không chạy chút nào ...
+server: write(fd, "hello")
+  └─► kernel: chép byte vào buffer client → thấy process đang chờ → ĐÁNH THỨC
+client: read() trả về "hello"
+```
+
+**Vòng lặp `read` để gom cho đủ, không phải để thăm dò.** Socket là luồng byte, một lần `read()` có thể chỉ lấy được một phần. "Đủ" do **giao thức** quyết định: HTTP (`Content-Length`, `chunked`, EOF), FastCGI (`contentLength` + `END_REQUEST`), Docker stream (trường `size`).
+
+| Cách chờ | Hoạt động | Ai dùng |
+|---|---|---|
+| **Blocking** | Mỗi kết nối một thread/process, ngủ trong `read()` | Worker FPM, Apache prefork, script PHP đơn giản |
+| **Non-blocking + epoll** | Một thread ngủ trong `epoll_wait()` trên hàng nghìn socket, kernel đánh thức kèm danh sách socket sẵn sàng | Nginx, Apache event, Poller của Tomcat (`Selector` bọc epoll) |
+| **Trông như blocking, bên dưới là epoll** | Goroutine / virtual thread "đỗ" lại, runtime dùng epoll | Go (`net/http`, docker CLI, dockerd), Java 21 virtual thread |
+| Busy-wait | `while(true)` thử đọc liên tục | Không ai dùng: tốn 100% CPU |
+
 ## Liên hệ Java
 
 - TCP socket: `java.net.ServerSocket` / `Socket`, hoặc NIO `ServerSocketChannel` (Acceptor của Tomcat dùng cái này).
@@ -146,5 +274,9 @@ namei -l /run/php/study.sock     # quyền từng thư mục cha
 - **Socket** là đối tượng trong kernel có buffer gửi và nhận, truy cập qua fd. Nó không nằm trên ổ đĩa.
 - **File `.sock`** là special file (loại `s`, size 0). Nó là **địa chỉ** để client tìm server và là **ổ khoá phân quyền** (owner, group, mode). Dữ liệu không bao giờ ghi vào file này.
 - Lỗi permission với Docker hay FPM có cùng một nguyên nhân: process client không có quyền `w` trên file socket.
+- **Đường dẫn ≠ socket object ≠ fd**: tên để tìm, đối tượng thật trong kernel, tay cầm của từng process.
+- Socket object là **cái ống do kernel quản lý**, không phải chương trình. Chương trình lắng nghe, hiểu giao thức và quyết định đóng. Kernel giữ trạng thái và chuyển byte.
+- Chỉ server `listen`. Mỗi `accept()` tạo một socket kết nối riêng. Hai bên `read`/`write` trên socket của mình.
+- `read()` không có dữ liệu thì process **ngủ**. Muốn phục vụ nhiều kết nối thì dùng **epoll**.
 
-Xem thêm: [apache-fpm-setup.md](apache-fpm-setup.md), [request-flow.md](request-flow.md).
+Xem thêm: [apache-fpm-setup.md](apache-fpm-setup.md), [request-flow.md](request-flow.md), [../../05-http-raw/work/http-connection.md](../../05-http-raw/work/http-connection.md), [../../10-docker/work/docker-architecture.md](../../10-docker/work/docker-architecture.md).
