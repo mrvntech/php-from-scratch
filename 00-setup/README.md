@@ -69,12 +69,60 @@ make -j"$(nproc)" && make install
 ~/opt/php-debug/bin/php -v       # bản DEBUG, không thay thế PHP của hệ thống
 ```
 
+## Góc nhìn cho dev Java
+
+SAPI có vai trò gần giống **Servlet container** (Tomcat, Jetty, Undertow): nó quyết định request vào bằng cách nào và response ra bằng cách nào.
+
+| PHP | Java |
+|---|---|
+| Zend Engine | JVM |
+| SAPI | Servlet container + Servlet API |
+| `cli` (`php file.php`) | `java Main`, `main(String[] args)` |
+| `cli-server` (`php -S`) | `jwebserver` (JDK 18+), chỉ để dev |
+| `fpm-fcgi` sau Nginx | Tomcat sau Nginx |
+| FastCGI | AJP / HTTP reverse proxy |
+| `embed` | JNI Invocation API |
+| `$_GET`, `$_POST`, `$_SERVER` | `HttpServletRequest` |
+| `echo`, `header()` | `response.getWriter()`, `response.setHeader()` |
+| `php.ini` riêng cho từng SAPI | JVM flags / `application.properties` riêng cho từng lần chạy |
+
+Hai bên khác nhau về hướng của interface. Servlet API là interface Java mà **app của bạn implement** (`doGet()`). SAPI là interface C mà **môi trường host implement** cho engine. Code PHP chỉ đọc superglobal và `echo`, nên bạn gần như không thấy SAPI.
+
+Khác biệt quan trọng nhất là **vòng đời**:
+- **Java (Tomcat):** một process sống lâu, mỗi request một thread. Field và singleton sống qua nhiều request, nên bạn phải lo thread-safety.
+- **PHP-FPM:** nhiều worker process, mỗi request bắt đầu với trạng thái sạch (*share-nothing*). Mọi biến và object bị huỷ khi request kết thúc. Muốn giữ state thì dùng session, Redis hoặc DB.
+- Các runtime FrankenPHP (worker mode), RoadRunner và Swoole giữ app PHP trong bộ nhớ giống mô hình Java. Chúng nhanh hơn, nhưng mang theo đúng các vấn đề của Java: state rò giữa request, memory leak.
+
+### 7. Kiểm chứng share-nothing
+Tạo `work/counter.php`:
+```php
+<?php
+static $count = 0;
+$GLOBALS['hits'] = ($GLOBALS['hits'] ?? 0) + 1;
+echo PHP_SAPI, ' | count=', ++$count, ' | hits=', $GLOBALS['hits'], PHP_EOL;
+```
+```bash
+php 00-setup/work/counter.php                  # chạy vài lần
+php -S localhost:8000 -t 00-setup/work &
+for i in 1 2 3; do curl -s localhost:8000/counter.php; done
+kill %1
+```
+Kết quả có giống bản Java dưới đây không? Vì sao?
+```java
+@RestController
+class CounterController {
+    private int count = 0;
+    @GetMapping("/hit") int hit() { return ++count; }   // 1, 2, 3, ...
+}
+```
+
 ## Câu hỏi tự kiểm tra
 
 - SAPI là gì? Kể các SAPI bạn biết và SAPI nào đang dùng khi chạy `php file.php`.
 - Tại sao CLI và Apache có `php.ini` khác nhau? Lợi và hại?
 - NTS và ZTS khác nhau thế nào? Bản đang cài là loại nào, vì sao?
 - `extension=` và `zend_extension=` khác nhau thế nào? OPcache thuộc loại nào?
+- So với Tomcat, PHP-FPM xử lý state giữa các request khác nhau thế nào? Mỗi cách có lợi và hại gì?
 
 ## Checklist
 
@@ -83,3 +131,4 @@ make -j"$(nproc)" && make install
 - [ ] `configs/php/99-study.ini` đã symlink và kiểm chứng
 - [ ] Cài và bật/tắt được extension bằng `phpenmod`/`phpdismod`
 - [ ] Đã quyết định giữ hay gỡ Apache (ghi lý do vào journal)
+- [ ] Chạy `work/counter.php` và giải thích kết quả so với bản Java
